@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Classroom Live Share</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;background:#0f172a;color:#fff}
+header{padding:18px;text-align:center;background:#1e293b;font-size:22px;font-weight:700}
+main{max-width:850px;margin:auto;padding:18px}
+.card{background:#1e293b;border-radius:18px;padding:22px;margin-bottom:16px;text-align:center}
+button,input{font-size:18px;padding:14px;border-radius:10px;margin:6px;border:0}
+button{background:#2563eb;color:#fff;font-weight:700;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
+.stop{background:#dc2626}.green{background:#059669}.dark{background:#475569}
+input{width:min(100%,330px);text-align:center;text-transform:uppercase;letter-spacing:3px}
+.code{font-size:42px;font-weight:800;letter-spacing:8px;margin:15px}
+.screen{background:#000;border-radius:14px;min-height:55vh;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
+video{width:100%;height:100%;max-height:78vh;object-fit:contain;background:#000}
+.hidden{display:none!important}
+.muted{color:#94a3b8}
+.big{font-size:20px}
+.badge{display:inline-block;padding:8px 12px;border-radius:999px;background:#334155;margin:5px}
+.error{color:#fca5a5}
+</style>
+</head>
+<body>
+<header>📺 Classroom Live Share</header>
+<main>
+
+<div id="home" class="card">
+  <h2>Teacher</h2>
+  <button onclick="startTeacher()">START CLASS</button>
+  <hr>
+  <h2>Student</h2>
+  <input id="joinCode" maxlength="6" placeholder="CLASS CODE" autocomplete="off">
+  <br>
+  <button class="green" onclick="startStudent()">WATCH TEACHER</button>
+  <p class="muted">Open this same website on the students' phones.</p>
+</div>
+
+<div id="teacherPanel" class="card hidden">
+  <div class="big">Your Classroom Code</div>
+  <div id="roomCode" class="code">------</div>
+  <div class="muted">Give this code to your students.</div>
+  <div id="studentCount" class="badge">0 students</div>
+  <br>
+  <button id="shareBtn" onclick="shareScreen()">SHARE MY SCREEN</button>
+  <button class="stop" onclick="stopScreen()">STOP</button>
+  <button class="dark" onclick="endClass()">END CLASS</button>
+  <p id="teacherStatus" class="muted">Waiting for students...</p>
+</div>
+
+<div id="studentPanel" class="card hidden">
+  <h2>Teacher's Screen</h2>
+  <div class="screen">
+    <video id="remoteVideo" autoplay playsinline></video>
+    <div id="waiting">Waiting for teacher to share...</div>
+  </div>
+  <br>
+  <button class="dark" onclick="goFullscreen()">⛶ FULLSCREEN</button>
+</div>
+
+<p id="status" class="muted"></p>
+</main>
+
+<script>
+const ws = new WebSocket(
+  (location.protocol === "https:" ? "wss://" : "ws://") + location.host
+);
+
+let clientId = null;
+let role = "";
+let room = "";
+let stream = null;
+const peers = new Map();
+const pendingIce = new Map();
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" }
+  ]
+};
+
+const $ = id => document.getElementById(id);
+
+function show(id){$(id).classList.remove("hidden")}
+function hide(id){$(id).classList.add("hidden")}
+function setStatus(text){$("status").textContent=text}
+
+function wsSend(message) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+  }
+}
+
+ws.onopen = () => setStatus("Connected to classroom server.");
+ws.onclose = () => setStatus("Connection to server closed. Refresh to reconnect.");
+ws.onerror = () => setStatus("Could not connect to the classroom server.");
+
+ws.onmessage = async (event) => {
+  const m = JSON.parse(event.data);
+
+  if (m.type === "ready") {
+    clientId = m.id;
+    return;
+  }
+
+  if (m.type === "created") {
+    room = m.room;
+    role = "teacher";
+    hide("home");
+    show("teacherPanel");
+    $("roomCode").textContent = room;
+    $("teacherStatus").textContent = "Waiting for students...";
+    setStatus("Classroom ready.");
+    return;
+  }
+
+  if (m.type === "joined") {
+    room = m.room;
+    role = "student";
+    clientId = m.id;
+    hide("home");
+    show("studentPanel");
+    setStatus("Connected. Waiting for teacher...");
+    return;
+  }
+
+  if (m.type === "student-joined" && role === "teacher") {
+    updateStudentCount(1);
+    await createTeacherPeer(m.id);
+    return;
+  }
+
+  if (m.type === "student-left" && role === "teacher") {
+    closePeer(m.id);
+    updateStudentCount(-1);
+    return;
+  }
+
+  if (m.type === "offer" && role === "student") {
+    await handleOffer(m);
+    return;
+  }
+
+  if (m.type === "answer" && role === "teacher") {
+    const pc = peers.get(m.from);
+    if (pc) {
+      await pc.setRemoteDescription(m.description);
+      await flushIce(m.from);
+    }
+    return;
+  }
+
+  if (m.type === "ice") {
+    const id = role === "teacher" ? m.from : m.from;
+    const pc = peers.get(id);
+
+    if (pc && pc.remoteDescription) {
+      await pc.addIceCandidate(m.candidate).catch(()=>{});
+    } else {
+      if (!pendingIce.has(id)) pendingIce.set(id, []);
+      pendingIce.get(id).push(m.candidate);
+    }
+    return;
+  }
+
+  if (m.type === "stop" && role === "student") {
+    $("remoteVideo").srcObject = null;
+    $("waiting").classList.remove("hidden");
+    setStatus("Teacher stopped sharing.");
+    return;
+  }
+
+  if (m.type === "teacher-ended") {
+    if (role === "student") {
+      $("remoteVideo").srcObject = null;
+      $("waiting").classList.remove("hidden");
+      setStatus("Teacher ended the class.");
+    }
+    return;
+  }
+
+  if (m.type === "error") {
+    alert(m.message || "Classroom error.");
+  }
+};
+
+function updateStudentCount(delta) {
+  const current = Number(($("studentCount").textContent.match(/\d+/)||[0])[0]);
+  const n = Math.max(0, current + delta);
+  $("studentCount").textContent = n + (n === 1 ? " student" : " students");
+  if (n) $("teacherStatus").textContent = n + " student(s) connected.";
+  else if (!stream) $("teacherStatus").textContent = "Waiting for students...";
+}
+
+function startTeacher() {
+  wsSend({type:"create"});
+}
+
+function startStudent() {
+  const code = $("joinCode").value.trim().toUpperCase();
+  if (!/^[A-Z0-9]{6}$/.test(code)) {
+    alert("Enter the 6-character classroom code.");
+    return;
+  }
+  wsSend({type:"join", room:code});
+}
+
+async function shareScreen() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    alert("This browser does not support screen sharing. Use Chrome or Edge on a computer.");
+    return;
+  }
+
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { cursor: "always" },
+      audio: true
+    });
+
+    $("shareBtn").disabled = true;
+    $("teacherStatus").textContent = "LIVE — students can watch now.";
+    setStatus("Your screen is being shared.");
+
+    const track = stream.getVideoTracks()[0];
+    track.onended = stopScreen;
+
+    for (const [studentId, pc] of peers) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track && sender.track.kind === "video") {
+          await sender.replaceTrack(track);
+        } else if (sender.track && sender.track.kind === "audio") {
+          const audio = stream.getAudioTracks()[0];
+          if (audio) await sender.replaceTrack(audio);
+        }
+      }
+
+      if (!pc.getSenders().some(s => s.track && s.track.kind === "video")) {
+        stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      }
+
+      await sendTeacherOffer(studentId, pc);
+    }
+  } catch (err) {
+    console.error(err);
+    $("teacherStatus").textContent = "Screen sharing was not started.";
+    setStatus("Screen sharing was cancelled or blocked by the browser.");
+  }
+}
+
+async function createTeacherPeer(studentId) {
+  const pc = new RTCPeerConnection(ICE_SERVERS);
+  peers.set(studentId, pc);
+
+  pc.onicecandidate = event => {
+    if (event.candidate) {
+      wsSend({
+        type:"ice",
+        target:studentId,
+        candidate:event.candidate
+      });
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (["failed","closed","disconnected"].includes(pc.connectionState)) {
+      // Keep the peer object until the student actually leaves.
+    }
+  };
+
+  if (stream) {
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+  }
+
+  await sendTeacherOffer(studentId, pc);
+}
+
+async function sendTeacherOffer(studentId, pc) {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  wsSend({
+    type:"offer",
+    target:studentId,
+    description:pc.localDescription
+  });
+}
+
+async function handleOffer(message) {
+  let pc = peers.get(message.from);
+
+  if (!pc) {
+    pc = new RTCPeerConnection(ICE_SERVERS);
+    peers.set(message.from, pc);
+
+    pc.ontrack = event => {
+      if (event.streams && event.streams[0]) {
+        $("remoteVideo").srcObject = event.streams[0];
+        $("waiting").classList.add("hidden");
+        setStatus("LIVE — teacher screen");
+      }
+    };
+
+    pc.onicecandidate = event => {
+      if (event.candidate) {
+        wsSend({
+          type:"ice",
+          target:message.from,
+          candidate:event.candidate
+        });
+      }
+    };
+  }
+
+  await pc.setRemoteDescription(message.description);
+  await flushIce(message.from);
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  wsSend({
+    type:"answer",
+    target:message.from,
+    description:pc.localDescription
+  });
+}
+
+async function flushIce(id) {
+  const pc = peers.get(id);
+  const list = pendingIce.get(id) || [];
+  if (!pc || !pc.remoteDescription) return;
+
+  for (const candidate of list) {
+    await pc.addIceCandidate(candidate).catch(()=>{});
+  }
+  pendingIce.delete(id);
+}
+
+function closePeer(id) {
+  const pc = peers.get(id);
+  if (pc) pc.close();
+  peers.delete(id);
+  pendingIce.delete(id);
+}
+
+function stopScreen() {
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+  }
+  stream = null;
+
+  $("shareBtn").disabled = false;
+  $("teacherStatus").textContent = "Screen sharing stopped.";
+  setStatus("Screen sharing stopped.");
+
+  wsSend({type:"stop"});
+}
+
+function endClass() {
+  if (!confirm("End this classroom?")) return;
+
+  if (stream) stopScreen();
+  wsSend({type:"end"});
+
+  for (const id of peers.keys()) closePeer(id);
+
+  room = "";
+  role = "";
+  hide("teacherPanel");
+  show("home");
+  setStatus("Class ended.");
+}
+
+async function goFullscreen() {
+  const video = $("remoteVideo");
+  try {
+    if (video.requestFullscreen) {
+      await video.requestFullscreen();
+    } else if (video.webkitEnterFullscreen) {
+      video.webkitEnterFullscreen();
+    }
+  } catch {}
+}
+</script>
+</body>
+</html>
